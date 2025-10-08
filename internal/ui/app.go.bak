@@ -1,0 +1,468 @@
+package ui
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/makalin/gittree/internal/config"
+	"github.com/makalin/gittree/internal/git"
+)
+
+// App represents the main application
+type App struct {
+	repo   *git.Repository
+	config *config.Config
+	filter git.FilterOptions
+	model  *Model
+}
+
+// NewApp creates a new application instance
+func NewApp(repo *git.Repository, cfg *config.Config, filter git.FilterOptions) *App {
+	model := NewModel(repo, cfg, filter)
+	return &App{
+		repo:   repo,
+		config: cfg,
+		filter: filter,
+		model:  model,
+	}
+}
+
+// Run starts the application
+func (a *App) Run() error {
+	// Load commits in background
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		
+		commits, err := a.repo.GetCommits(ctx, a.filter)
+		if err != nil {
+			a.model.err = err
+			return
+		}
+		
+		a.model.commits = commits
+		a.model.loading = false
+	}()
+
+	// Create and run the TUI
+	p := bubbletea.NewProgram(a.model, bubbletea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// Model represents the application state
+type Model struct {
+	repo     *git.Repository
+	config   *config.Config
+	filter   git.FilterOptions
+	commits  []*git.Commit
+	loading  bool
+	err      error
+	selected int
+	offset   int
+	height   int
+	width    int
+	unicode  bool
+	showHelp bool
+	helpText string
+}
+
+// NewModel creates a new model instance
+func NewModel(repo *git.Repository, cfg *config.Config, filter git.FilterOptions) *Model {
+	return &Model{
+		repo:     repo,
+		config:   cfg,
+		filter:   filter,
+		commits:  []*git.Commit{},
+		loading:  true,
+		unicode:  cfg.Unicode,
+		showHelp: false,
+		helpText: getHelpText(),
+	}
+}
+
+// Init initializes the model
+func (m Model) Init() bubbletea.Cmd {
+	return nil
+}
+
+// Update handles messages and updates the model
+func (m Model) Update(msg bubbletea.Msg) (Model, bubbletea.Cmd) {
+	switch msg := msg.(type) {
+	case bubbletea.KeyMsg:
+		return m.handleKeyPress(msg)
+	case bubbletea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		return m, nil
+	}
+	return m, nil
+}
+
+// View renders the UI
+func (m Model) View() string {
+	if m.showHelp {
+		return m.renderHelp()
+	}
+
+	if m.loading {
+		return m.renderLoading()
+	}
+
+	if m.err != nil {
+		return m.renderError()
+	}
+
+	return m.renderGraph()
+}
+
+// handleKeyPress handles key press events
+func (m Model) handleKeyPress(msg bubbletea.KeyMsg) (Model, bubbletea.Cmd) {
+	switch msg.String() {
+	case "q", "ctrl+c":
+		return m, bubbletea.Quit
+	case "?":
+		m.showHelp = !m.showHelp
+		return m, nil
+	case "u":
+		m.unicode = !m.unicode
+		return m, nil
+	case "up", "k":
+		if m.selected > 0 {
+			m.selected--
+		}
+		return m, nil
+	case "down", "j":
+		if m.selected < len(m.commits)-1 {
+			m.selected++
+		}
+		return m, nil
+	case "left", "h":
+		// Jump to parent
+		if m.selected < len(m.commits) && len(m.commits[m.selected].Parents) > 0 {
+			// Find parent commit
+			parentHash := m.commits[m.selected].Parents[0]
+			for i, commit := range m.commits {
+				if commit.Hash == parentHash {
+					m.selected = i
+					break
+				}
+			}
+		}
+		return m, nil
+	case "right", "l":
+		// Jump to child
+		if m.selected < len(m.commits) {
+			currentHash := m.commits[m.selected].Hash
+			for i, commit := range m.commits {
+				for _, parent := range commit.Parents {
+					if parent == currentHash {
+						m.selected = i
+						return m, nil
+					}
+				}
+			}
+		}
+		return m, nil
+	case "g":
+		m.selected = 0
+		return m, nil
+	case "G":
+		m.selected = len(m.commits) - 1
+		return m, nil
+	case "pgup":
+		if m.selected > 10 {
+			m.selected -= 10
+		} else {
+			m.selected = 0
+		}
+		return m, nil
+	case "pgdown":
+		if m.selected < len(m.commits)-10 {
+			m.selected += 10
+		} else {
+			m.selected = len(m.commits) - 1
+		}
+		return m, nil
+	case "enter":
+		if m.selected < len(m.commits) {
+			return m.showCommitDetails(m.commits[m.selected])
+		}
+		return m, nil
+	case "c":
+		if m.selected < len(m.commits) {
+			return m.checkoutCommit(m.commits[m.selected])
+		}
+		return m, nil
+	case "x":
+		if m.selected < len(m.commits) {
+			return m.resetToCommit(m.commits[m.selected])
+		}
+		return m, nil
+	case "p":
+		if m.selected < len(m.commits) {
+			return m.cherryPickCommit(m.commits[m.selected])
+		}
+		return m, nil
+	case "r":
+		if m.selected < len(m.commits) {
+			return m.revertCommit(m.commits[m.selected])
+		}
+		return m, nil
+	case "b":
+		if m.selected < len(m.commits) {
+			return m.createBranch(m.commits[m.selected])
+		}
+		return m, nil
+	case "t":
+		if m.selected < len(m.commits) {
+			return m.createTag(m.commits[m.selected])
+		}
+		return m, nil
+	}
+
+	return m, nil
+}
+
+// renderGraph renders the commit graph
+func (m Model) renderGraph() string {
+	if len(m.commits) == 0 {
+		return "No commits found"
+	}
+
+	var lines []string
+	start := max(0, m.selected-m.height/2)
+	end := min(len(m.commits), start+m.height)
+
+	for i := start; i < end; i++ {
+		commit := m.commits[i]
+		line := m.renderCommit(commit, i == m.selected)
+		lines = append(lines, line)
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// renderCommit renders a single commit line
+func (m Model) renderCommit(commit *git.Commit, selected bool) string {
+	// Render graph
+	graph := m.renderGraphLine(commit)
+	
+	// Render commit info
+	info := fmt.Sprintf("%s %s %s %s",
+		commit.ShortHash,
+		commit.Author,
+		commit.Date.Format(m.config.DateFormat),
+		commit.Message,
+	)
+	
+	// Add refs
+	if len(commit.Refs) > 0 {
+		refs := strings.Join(commit.Refs, ", ")
+		info += fmt.Sprintf(" (%s)", refs)
+	}
+	
+	// Apply selection styling
+	if selected {
+		info = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("yellow")).Render(info)
+	}
+	
+	return graph + " " + info
+}
+
+// renderGraphLine renders the graph line for a commit
+func (m Model) renderGraphLine(commit *git.Commit) string {
+	if len(commit.Graph) == 0 {
+		return "●"
+	}
+	
+	var chars []string
+	for _, line := range commit.Graph {
+		char := m.getGraphChar(line)
+		chars = append(chars, char)
+	}
+	
+	return strings.Join(chars, "")
+}
+
+// getGraphChar returns the character for a graph line
+func (m Model) getGraphChar(line git.GraphLine) string {
+	if m.unicode {
+		switch line.Type {
+		case git.GraphLineVertical:
+			return "│"
+		case git.GraphLineHorizontal:
+			return "─"
+		case git.GraphLineCorner:
+			return "└"
+		case git.GraphLineMerge:
+			return "●"
+		default:
+			return " "
+		}
+	} else {
+		switch line.Type {
+		case git.GraphLineVertical:
+			return "|"
+		case git.GraphLineHorizontal:
+			return "-"
+		case git.GraphLineCorner:
+			return "\\"
+		case git.GraphLineMerge:
+			return "*"
+		default:
+			return " "
+		}
+	}
+}
+
+// renderLoading renders the loading screen
+func (m Model) renderLoading() string {
+	return "Loading commits..."
+}
+
+// renderError renders the error screen
+func (m Model) renderError() string {
+	return fmt.Sprintf("Error: %v", m.err)
+}
+
+// renderHelp renders the help screen
+func (m Model) renderHelp() string {
+	return m.helpText
+}
+
+// showCommitDetails shows detailed information about a commit
+func (m Model) showCommitDetails(commit *git.Commit) (Model, bubbletea.Cmd) {
+	// This would show a detailed view of the commit
+	// For now, just print to console
+	fmt.Printf("Commit: %s\n", commit.Hash)
+	fmt.Printf("Author: %s <%s>\n", commit.Author, commit.Email)
+	fmt.Printf("Date: %s\n", commit.Date.Format(time.RFC3339))
+	fmt.Printf("Message: %s\n", commit.Message)
+	fmt.Printf("Parents: %s\n", strings.Join(commit.Parents, ", "))
+	fmt.Printf("Files: %s\n", strings.Join(commit.Files, ", "))
+	
+	return m, nil
+}
+
+// checkoutCommit checks out a commit
+func (m Model) checkoutCommit(commit *git.Commit) (Model, bubbletea.Cmd) {
+	if m.config.ConfirmDangerous {
+		// In a real implementation, this would show a confirmation dialog
+		fmt.Printf("Checkout %s? (y/N): ", commit.ShortHash)
+	}
+	
+	err := m.repo.Checkout(commit.Hash)
+	if err != nil {
+		m.err = err
+	}
+	
+	return m, nil
+}
+
+// resetToCommit resets to a commit
+func (m Model) resetToCommit(commit *git.Commit) (Model, bubbletea.Cmd) {
+	if m.config.ConfirmDangerous {
+		// In a real implementation, this would show a confirmation dialog
+		fmt.Printf("Reset to %s? (y/N): ", commit.ShortHash)
+	}
+	
+	err := m.repo.ResetHard(commit.Hash)
+	if err != nil {
+		m.err = err
+	}
+	
+	return m, nil
+}
+
+// cherryPickCommit cherry-picks a commit
+func (m Model) cherryPickCommit(commit *git.Commit) (Model, bubbletea.Cmd) {
+	err := m.repo.CherryPick(commit.Hash)
+	if err != nil {
+		m.err = err
+	}
+	
+	return m, nil
+}
+
+// revertCommit reverts a commit
+func (m Model) revertCommit(commit *git.Commit) (Model, bubbletea.Cmd) {
+	err := m.repo.Revert(commit.Hash)
+	if err != nil {
+		m.err = err
+	}
+	
+	return m, nil
+}
+
+// createBranch creates a branch at a commit
+func (m Model) createBranch(commit *git.Commit) (Model, bubbletea.Cmd) {
+	// In a real implementation, this would prompt for branch name
+	branchName := fmt.Sprintf("branch-%s", commit.ShortHash)
+	err := m.repo.CreateBranch(branchName, commit.Hash)
+	if err != nil {
+		m.err = err
+	}
+	
+	return m, nil
+}
+
+// createTag creates a tag at a commit
+func (m Model) createTag(commit *git.Commit) (Model, bubbletea.Cmd) {
+	// In a real implementation, this would prompt for tag name
+	tagName := fmt.Sprintf("tag-%s", commit.ShortHash)
+	err := m.repo.CreateTag(tagName, commit.Hash)
+	if err != nil {
+		m.err = err
+	}
+	
+	return m, nil
+}
+
+// getHelpText returns the help text
+func getHelpText() string {
+	return `gittree - GitHub-like Git Graph
+
+KEYBINDINGS:
+  ↑/k / ↓/j          Move selection
+  ←/h / →/l          Jump parents/children
+  PgUp / PgDn        Page
+  g / G              Top / Bottom
+  Enter              Open commit (details pane)
+  c                  Checkout selected
+  x                  Reset to selected
+  p                  Cherry-pick selected
+  r                  Revert selected
+  b                  New branch at selected
+  t                  New tag at selected
+  /                  Filter (author/msg/path)
+  f                  Toggle follow file
+  u                  Toggle Unicode lanes
+  ?                  Help
+  q                  Quit
+
+Press ? to close this help.`
+}
+
+// Helper functions
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

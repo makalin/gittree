@@ -1,0 +1,25 @@
+[package]
+name = "gittree"
+version = "0.1.0"
+edition = "2021"
+description = "A fast TUI that renders an ASCII/Unicode commit tree like GitHub's network graph"
+license = "MIT"
+repository = "https://github.com/makalin/gittree"
+keywords = ["git", "tui", "graph", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "gittree"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.24"
+crossterm = "0.27"
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+git2 = "0.18"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1.10"
+clap = { version = "4.4", features = ["derive"] }
+anyhow = "1.0"
+thiserror = "1.0"

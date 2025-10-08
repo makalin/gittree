@@ -1,0 +1,12 @@
+style: auto           # light | dark | auto
+unicode: true
+dateFormat: "2006-01-02 15:04"
+confirmDangerous: true
+paging: "auto"        # auto | always | never
+colors:
+  graph1: "blue"
+  graph2: "magenta"
+  head:   "cyan"
+git:
+  defaultRange: ""
+  extraArgs: []
